@@ -21,7 +21,7 @@ JNIEXPORT jint JNICALL
                                                                  jint    task_queue_size,
                                                                  jint    timeOutMilliseconds)
 {
-    capture->init(4, 8, 5000);
+    capture->init(thread_pool_size, task_queue_size, 5000);
     return 1;
 }
 
