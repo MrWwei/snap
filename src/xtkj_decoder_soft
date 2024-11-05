@@ -1,0 +1,441 @@
+/*
+ *                        ::
+ *                       :;J7, :,                        ::;7:
+ *                       ,ivYi, ,                       ;LLLFS:
+ *                       :iv7Yi                       :7ri;j5PL
+ *                      ,:ivYLvr                    ,ivrrirrY2X,
+ *                      :;r@Wwz.7r:                :ivu@kexianli.
+ *                     :iL7::,:::iiirii:ii;::::,,irvF7rvvLujL7ur
+ *                    ri::,:,::i:iiiiiii:i:irrv177JX7rYXqZEkvv17
+ *                 ;i:, , ::::iirrririi:i:::iiir2XXvii;L8OGJr71i
+ *               :,, ,,:   ,::ir@mingyi.irii:i:::j1jri7ZBOS7ivv,
+ *                  ,::,    ::rv77iiiriii:iii:i::,rvLq@huhao.Li
+ *              ,,      ,, ,:ir7ir::,:::i;ir:::i:i::rSGGYri712:
+ *            :::  ,v7r:: ::rrv77:, ,, ,:i7rrii:::::, ir7ri7Lri
+ *           ,     2OBBOi,iiir;r::        ,irriiii::,, ,iv7Luur:
+ *         ,,     i78MBBi,:,:::,:,  :7FSL: ,iriii:::i::,,:rLqXv::
+ *         :      iuMMP: :,:::,:ii;2GY7OBB0viiii:i:iii:i:::iJqL;::
+ *        ,     ::::i   ,,,,, ::LuBBu BBBBBErii:i:i:i:i:i:i:r77ii
+ *       ,       :       , ,,:::rruBZ1MBBqi, :,,,:::,::::::iiriri:
+ *      ,               ,,,,::::i:  @arqiao.       ,:,, ,:::ii;i7:
+ *     :,       rjujLYLi   ,,:::::,:::::::::,,   ,:i,:,,,,,::i:iii
+ *     ::      BBBBBBBBB0,    ,,::: , ,:::::: ,      ,,,, ,,:::::::
+ *     i,  ,  ,8BMMBBBBBBi     ,,:,,     ,,, , ,   , , , :,::ii::i::
+ *     :      iZMOMOMBBM2::::::::::,,,,     ,,,,,,:,,,::::i:irr:i:::,
+ *     i   ,,:;u0MBMOG1L:::i::::::  ,,,::,   ,,, ::::::i:i:iirii:i:i:
+ *     :    ,iuUuuXUkFu7i:iii:i:::, :,:,: ::::::::i:i:::::iirr7iiri::
+ *     :     :rk@Yizero.i:::::, ,:ii:::::::i:::::i::,::::iirrriiiri::,
+ *      :      5BMBBBBBBSr:,::rv2kuii:::iii::,:i:,, , ,,:,:i@petermu.,
+ *           , :r50EZ8MBBBBGOBBBZP7::::i::,:::::,: :,:,::i;rrririiii::
+ *               :jujYY7LS0ujJL7r::,::i::,::::::::::::::iirirrrrrrr:ii:
+ *            ,:  :@kevensun.:,:,,,::::i:i:::::,,::::::iir;ii;7v77;ii;i,
+ *            ,,,     ,,:,::::::i:iiiii:i::::,, ::::iiiir@xingjief.r;7:i,
+ *         , , ,,,:,,::::::::iiiiiiiiii:,:,:::::::::iiir;ri7vL77rrirri::
+ *          :,, , ::::::::i:::i:::i:i::,,,,,:,::i:i:::iir;@Secbone.ii:::
+ *
+ * @Author: wtwei
+ * @Date: 2023-08-08 14:02:28
+ * @LastEditTime: 2023-08-28 09:12:37
+ * @Description:
+ *
+ */
+
+#include "xtkj_decoder.h"
+// #include "RgaUtils.h"
+// #include "data_type.h"
+// #include "im2d.h"
+// #include "mk_mediakit.h"
+#include "opencv2/opencv.hpp"
+// #include "rga.h"
+#include "safe_queue.h"
+// #include "utils/mpp_decoder.h"
+// #include "utils/mpp_encoder.h"
+#include <chrono>
+#include <condition_variable>
+#include <future>
+#include <stack>
+
+#include <unordered_set>
+extern "C" {
+#include "libavcodec/avcodec.h"
+#include "libavformat/avformat.h"
+#include "libavutil/avutil.h"
+#include "libswscale/swscale.h"
+}
+#include <queue>
+#include <thread>
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+using namespace xtkj;
+static unsigned char* load_data(FILE* fp, size_t ofst, size_t sz);
+static unsigned char* read_file_data(const char* filename, int* model_size);
+// typedef struct
+// {
+//     MppDecoder* decoder;
+//     MppEncoder* encoder;
+// } app_context_t;
+typedef struct
+{
+    int   width;
+    int   height;
+    int   width_stride;
+    int   height_stride;
+    int   format;
+    void* virt_addr   = nullptr;
+    void* packet_data = nullptr;
+    int   packet_size = 0;
+    int   fd;
+} image_frame_t;
+#define MAX_STACK_SIZE 1
+vector<std::stack<image_frame_t*>> frame_stacks(16);
+
+class Decoder : public IDecoder {
+  public:
+    Decoder()
+        : format_ctx_(nullptr), codecContext_(nullptr), frame_(nullptr),
+          packet_(nullptr), videoStreamIndex_(-1){};
+    ~Decoder()
+    {
+        // if(worker_->joinable())
+        //     worker_->join();
+        closeStream();
+        avformat_network_deinit();
+        sws_freeContext(sws_ctx_);
+    };
+    int               init(int decode_thread_num,
+                           int frame_interval = 1,
+                           int timeout_ms     = 20) override;
+    vector<long long> get_frame() override;
+    bool              start(string video_path, string decode_type) override;
+    // bool              start(string video_path) override;
+    // bool              restart(string video_path) override;
+    int stop() override;
+
+  private:
+    int ins_index_ = 1;
+    int   decode_thread_num_ = 4;
+    int   frame_interval_    = 1;
+    void* mat_addr_          = nullptr;
+    // app_context_t*                       apps_ctx_;
+    // MppDecoder*                          decoder_;
+    std::shared_ptr<std::thread>         worker_;
+    vector<std::shared_ptr<std::thread>> decode_workers_;
+    // Queue<image_frame_t*>                frame_queue_;
+    // std::queue<image_frame_t*>           frame_decode_queue_;
+    std::mutex                           stack_mutex_;
+    // std::mutex                           frame_decode_queue_lock_;
+    std::condition_variable              stack_cond_;
+    // std::condition_variable              cond_stream_producer_;
+    // std::condition_variable              cond_stream_consumer_;
+    // std::condition_variable              cond_decode_producer_;
+    // std::condition_variable              cond_decode_consumer_;
+    int                                  MAX_QUEUE_SIZE = 2;
+    int                                  timeout_ms_    = 20;  // ms
+    bool                                 run_           = false;
+
+    // ffmpeg
+    AVCodecContext*    codecContext_;
+    AVFormatContext*   format_ctx_;
+    AVCodecParameters* codecParameters_;
+    // AVBitStreamFilterContext* bsf_ctx_;
+    AVCodec*    codec_;
+    AVPacket*   packet_;
+    AVFrame*    frame_;
+    SwsContext* sws_ctx_{nullptr};
+    int         videoStreamIndex_;
+    int         cvLinesizes_[1];
+    bool        first_prepare_ = true;
+
+    void openStream(string stream_addr);
+    void closeStream();
+    void process_video(const char* path, std::promise<bool>& pro);
+};
+int Decoder::init(int decode_thread_num, int frame_interval, int timeout_ms)
+{
+    decode_thread_num_ = decode_thread_num;
+    frame_interval_    = frame_interval;
+    timeout_ms_        = timeout_ms;
+    ins_index_ = decode_thread_num;
+    // frame_queue_.setLen(MAX_QUEUE_SIZE);
+    // av_register_all();
+    // avformat_network_init();
+    int video_type = 264;
+    printf("Decoder init OK!\n");
+    return 0;
+}
+void Decoder::closeStream()
+{
+    if (frame_) {
+        av_frame_free(&frame_);
+        frame_ = nullptr;
+    }
+
+    if (packet_) {
+        av_packet_unref(packet_);
+        packet_ = nullptr;
+    }
+
+    if (codecContext_) {
+        avcodec_free_context(&codecContext_);
+        codecContext_ = nullptr;
+    }
+
+    if (format_ctx_) {
+        avformat_close_input(&format_ctx_);
+        format_ctx_ = nullptr;
+    }
+}
+void Decoder::openStream(string stream_addr)
+{
+    closeStream();
+
+    format_ctx_ = avformat_alloc_context();
+    if (!format_ctx_) {
+        std::cerr << "无法分配 AVFormatContext" << std::endl;
+        return;
+    }
+
+    if (avformat_open_input(&format_ctx_, stream_addr.c_str(), nullptr,
+                            nullptr) != 0) {
+        std::cerr << "无法打开 RTSP 流" << std::endl;
+        return;
+    }
+
+    if (avformat_find_stream_info(format_ctx_, nullptr) < 0) {
+        std::cerr << "无法获取流信息" << std::endl;
+        return;
+    }
+
+    videoStreamIndex_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_VIDEO, -1,
+                                            -1, nullptr, 0);
+    // for (unsigned int i = 0; i < format_ctx_->nb_streams; i++) {
+    //     if (format_ctx_->streams[i]->codecpar->codec_type ==
+    //         AVMEDIA_TYPE_VIDEO) {
+    //         videoStreamIndex_ = i;
+    //         break;
+    //     }
+    // }
+    if (videoStreamIndex_ == AVERROR_STREAM_NOT_FOUND) {
+        std::cerr << "未找到视频流" << std::endl;
+        return;
+    }
+
+    AVCodecParameters* codecParams =
+        format_ctx_->streams[videoStreamIndex_]->codecpar;
+    const AVCodec* codec = NULL;
+    codec                = avcodec_find_decoder(codecParams->codec_id);
+    if (!codec) {
+        std::cerr << "无法找到解码器" << std::endl;
+        return;
+    }
+
+    codecContext_ = avcodec_alloc_context3(codec);
+    if (!codecContext_) {
+        std::cerr << "无法分配解码器上下文" << std::endl;
+        return;
+    }
+
+    if (avcodec_parameters_to_context(codecContext_, codecParams) < 0) {
+        std::cerr << "无法初始化解码器上下文" << std::endl;
+        return;
+    }
+
+    if (avcodec_open2(codecContext_, codec, nullptr) < 0) {
+        std::cerr << "无法打开解码器" << std::endl;
+        return;
+    }
+    // 查找H264比特流过滤器
+    // bsf_ctx_ = av_bitstream_filter_init("h264_mp4toannexb");
+    // if (!bsf_ctx_) {
+    //     std::cout << "无法找到H264比特流过滤器" << std::endl;
+    //     avformat_close_input(&format_ctx_);
+    //     return;
+    // }
+    frame_  = av_frame_alloc();
+    packet_ = av_packet_alloc();
+}
+bool Decoder::start(string video_path, string decode_type)
+{
+    std::promise<bool> pro;
+    run_ = false;
+    if (worker_) {
+        worker_->join();
+        worker_.reset();
+    }
+    run_ = true;
+    openStream(video_path);
+
+    worker_ = std::make_shared<std::thread>(&Decoder::process_video, this,
+                                            video_path.c_str(), std::ref(pro));
+
+    return pro.get_future().get();
+}
+int Decoder::stop()
+{
+    run_ = false;
+    if (worker_) {
+        worker_->join();
+        worker_.reset();
+    }
+    closeStream();
+
+    return 0;
+}
+void Decoder::process_video(const char* path, std::promise<bool>& pro)
+{
+    printf("start process video file...\n");
+    int ret;
+    pro.set_value(true);
+    first_prepare_ = true;
+    int count      = 0;
+    while (av_read_frame(format_ctx_, packet_) >= 0 && run_) {
+        if (packet_->stream_index == videoStreamIndex_) {
+            avcodec_send_packet(codecContext_, packet_);
+            while (avcodec_receive_frame(codecContext_, frame_) == 0) {
+                count++;
+                // if (frame_interval_ > 0)
+                //     if (count % frame_interval_ == 0) {
+                //         // av_packet_unref(packet_);
+                //         continue;
+                //     }
+                int            width     = frame_->width;
+                int            height    = frame_->height;
+                image_frame_t* frame_job = new image_frame_t();
+                frame_job->virt_addr =
+                    malloc(frame_->width * frame_->height * 3);
+                uchar* mat_data = (uchar*)frame_job->virt_addr;
+                if (first_prepare_) {
+                    cvLinesizes_[0] = 3 * frame_->width;
+
+                    sws_ctx_ = sws_getContext(
+                        width, height, (AVPixelFormat)frame_->format, width,
+                        height, AVPixelFormat::AV_PIX_FMT_BGR24,
+                        SWS_FAST_BILINEAR, NULL, NULL, NULL);
+                    first_prepare_ = false;
+                }
+                sws_scale(sws_ctx_, frame_->data, frame_->linesize, 0, height,
+                          &mat_data, cvLinesizes_);
+                frame_job->height = frame_->height;
+                frame_job->width  = frame_->width;
+
+                {
+                    std::unique_lock<std::mutex> lock(stack_mutex_);
+                    while(frame_stacks[ins_index_].size() >= MAX_STACK_SIZE){
+                        image_frame_t* frame_info_ptr_del = frame_stacks[ins_index_].top();
+                        frame_stacks[ins_index_].pop();
+                        
+                        if(frame_info_ptr_del->virt_addr!=nullptr){
+                            free(frame_info_ptr_del->virt_addr);
+                            frame_info_ptr_del->virt_addr = nullptr; 
+                        }
+                        if(frame_info_ptr_del!=nullptr){
+                            delete frame_info_ptr_del;
+                            frame_info_ptr_del = nullptr;
+                        }
+                    }
+                    frame_stacks[ins_index_].push(frame_job);
+                    stack_cond_.notify_all();
+
+
+                }
+                
+            }
+        }
+        av_packet_unref(packet_);
+    }
+    sws_freeContext(sws_ctx_);
+    printf("read stream ok!\n");
+}
+
+vector<long long> Decoder::get_frame()
+{
+    image_frame_t* frame_info_ptr{nullptr};
+    int ins_index = ins_index_;
+    {
+      std::unique_lock<std::mutex> lock(stack_mutex_);
+      stack_cond_.wait_for(lock,std::chrono::milliseconds(50),[ins_index]{return !frame_stacks[ins_index].empty();});
+      // if(frame_stacks_[ins_index].empty()){
+      //   stack_conds_[app_ctx_.instance_index].wait(lock);
+      // }
+      // printf("af wait\n");
+      if(frame_stacks[ins_index_].empty()) return {};
+      frame_info_ptr = frame_stacks[ins_index_].top();
+      frame_stacks[ins_index_].pop();
+      stack_cond_.notify_all();
+    }
+    // std::cout << "sdk get frame ok" << std::endl;
+
+    int   height   = frame_info_ptr->height;
+    int   width    = frame_info_ptr->width;
+    void* mat_addr_ = std::move(frame_info_ptr->virt_addr);
+    if(frame_info_ptr!=nullptr){
+      delete frame_info_ptr;
+      frame_info_ptr = nullptr;
+    }
+    vector<long long> mat_info = {(long long)mat_addr_, width, height, 0};
+    // frame_atomics[app_ctx_.instance_index].store(nullptr);
+    return mat_info;
+}
+
+static unsigned char* load_data(FILE* fp, size_t ofst, size_t sz)
+{
+    unsigned char* data;
+    int            ret;
+
+    data = NULL;
+
+    if (NULL == fp) {
+        return NULL;
+    }
+
+    ret = fseek(fp, ofst, SEEK_SET);
+    if (ret != 0) {
+        printf("blob seek failure.\n");
+        return NULL;
+    }
+
+    data = (unsigned char*)malloc(sz);
+    if (data == NULL) {
+        printf("buffer malloc failure.\n");
+        return NULL;
+    }
+    ret = fread(data, 1, sz, fp);
+    return data;
+}
+
+static unsigned char* read_file_data(const char* filename, int* model_size)
+{
+    FILE*          fp;
+    unsigned char* data;
+
+    fp = fopen(filename, "rb");
+    if (NULL == fp) {
+        printf("Open file %s failed.\n", filename);
+        return NULL;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    int size = ftell(fp);
+
+    data = load_data(fp, 0, size);
+
+    fclose(fp);
+
+    *model_size = size;
+    return data;
+}
+IDecoder* xtkj::createDecoder()
+{
+    return new Decoder();
+}
+
+void xtkj::releaseDecoder(IDecoder* pIDecoder)
+{
+    delete[] pIDecoder;
+    pIDecoder = nullptr;
+}
+#ifdef __cplusplus
+}
+#endif

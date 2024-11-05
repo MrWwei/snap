@@ -1,0 +1,411 @@
+#include "xtkj_decoder.h"
+#include "RgaUtils.h"
+#include "data_type.h"
+#include "im2d.h"
+// #include "mk_mediakit.h"
+#include "opencv2/opencv.hpp"
+#include "rga.h"
+#include "safe_queue.h"
+// #include "utils/mpp_decoder.h"
+// #include "utils/mpp_encoder.h"
+#include <condition_variable>
+#include <future>
+#include <unordered_set>
+extern "C" {
+#include "libavcodec/avcodec.h"
+#include "libavformat/avformat.h"
+#include "libavutil/avutil.h"
+#include "libswscale/swscale.h"
+}
+#include <queue>
+#include <thread>
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+using namespace xtkj;
+static unsigned char* load_data(FILE* fp, size_t ofst, size_t sz);
+static unsigned char* read_file_data(const char* filename, int* model_size);
+// typedef struct
+// {
+//     MppDecoder* decoder;
+//     MppEncoder* encoder;
+// } app_context_t;
+class Decoder : public IDecoder {
+  public:
+    Decoder(){
+        // decoder_ = new MppDecoder();
+    };
+    ~Decoder(){};
+    int               init(int decode_thread_num_) override;
+    vector<long long> get_frame() override;
+    bool              start(string video_path) override;
+    int               stop() override;
+
+  private:
+    int   decode_thread_num_ = 4;
+    void* mat_addr_          = nullptr;
+    // app_context_t*                       apps_ctx_;
+    // MppDecoder*                          decoder_;
+    std::shared_ptr<std::thread>         worker_;
+    vector<std::shared_ptr<std::thread>> decode_workers_;
+    Queue<image_frame_t*>                frame_queue_;
+    std::queue<image_frame_t*>           frame_decode_queue_;
+    std::mutex                           frame_queue_lock_;
+    std::mutex                           frame_decode_queue_lock_;
+    std::condition_variable              cond_stream_producer_;
+    std::condition_variable              cond_stream_consumer_;
+    std::condition_variable              cond_decode_producer_;
+    std::condition_variable              cond_decode_consumer_;
+    int                                  MAX_QUEUE_SIZE = 2;
+
+    void process_video(const char* path, std::promise<bool>& pro);
+    // void process_decode(app_context_t* ctx, std::promise<bool>& pro);
+};
+int Decoder::init(int decode_thread_num)
+{
+    decode_thread_num_ = decode_thread_num;
+
+    // apps_ctx_ = new app_context_t[decode_thread_num_];
+    // for (int i = 0; i < decode_thread_num_; i++) {
+    //     memset(&apps_ctx_[i], 0, sizeof(app_context_t));
+    // }
+    frame_queue_.setLen(MAX_QUEUE_SIZE);
+    av_register_all();
+    avformat_network_init();
+    int video_type = 264;
+    // for (int i = 0; i < decode_thread_num_; i++) {
+    //     apps_ctx_[i].decoder = new MppDecoder();
+    //     apps_ctx_[i].decoder->Init(video_type, 30, &apps_ctx_[i]);
+    // }
+    // decoder_->Init(video_type, 30, &apps_ctx_[0]);
+    // app_ctx_.decoder   = decoder_;
+    printf("init ok!\n");
+    return 0;
+}
+bool Decoder::start(string video_path)
+{
+    std::promise<bool> pro;
+
+    bool is_rtsp = false;
+    // if (strncmp(video_path.c_str(), "rtsp", 4) == 0) {
+    //     is_rtsp = true;
+    // }
+    worker_ = std::make_shared<std::thread>(&Decoder::process_video, this,
+                                            video_path.c_str(), std::ref(pro));
+    // for (int i = 0; i < decode_thread_num_; i++) {
+    //     std::shared_ptr<std::thread> worker;
+    //     decode_workers_.push_back(worker);
+    // }
+    // for (int i = 0; i < decode_thread_num_; i++) {
+    //     std::promise<bool> pro;
+    //     decode_workers_[i] = std::make_shared<std::thread>(
+    //         &Decoder::process_decode, this, &apps_ctx_[i], std::ref(pro));
+    //     pro.get_future().get();
+    // }
+
+    return pro.get_future().get();
+}
+
+void Decoder::process_video(const char* path, std::promise<bool>& pro)
+{
+    printf("start process video file...\n");
+    AVFormatContext* format_ctx = nullptr;
+    // 打开输入文件
+    if (avformat_open_input(&format_ctx, path, nullptr, nullptr) != 0) {
+        std::cout << "无法打开输入文件" << std::endl;
+        return;
+    }
+    // 检索流信息
+    if (avformat_find_stream_info(format_ctx, nullptr) < 0) {
+        std::cout << "无法检索流信息" << std::endl;
+        avformat_close_input(&format_ctx);
+        return;
+    }
+    // 查找视频流
+    int video_stream_index = -1;
+    for (unsigned int i = 0; i < format_ctx->nb_streams; i++) {
+        if (format_ctx->streams[i]->codecpar->codec_type ==
+            AVMEDIA_TYPE_VIDEO) {
+            video_stream_index = i;
+            break;
+        }
+    }
+
+    if (video_stream_index == -1) {
+        std::cout << "没有找到视频流" << std::endl;
+        avformat_close_input(&format_ctx);
+        return;
+    }
+
+    // 获取视频流的编码参数
+    AVCodecParameters* codecParameters =
+        format_ctx->streams[video_stream_index]->codecpar;
+
+    // 查找H264比特流过滤器
+    AVBitStreamFilterContext* bsf_ctx =
+        av_bitstream_filter_init("h264_mp4toannexb");
+    if (!bsf_ctx) {
+        std::cout << "无法找到H264比特流过滤器" << std::endl;
+        avformat_close_input(&format_ctx);
+        return;
+    }
+
+    AVPacket packet;
+    // 提取裸码流
+    int ret;
+    int frame_index = 0;
+    pro.set_value(true);
+    // auto start = std::chrono::high_resolution_clock::now();
+
+    // 查找解码器
+    AVCodec* codec = nullptr;
+    codec          = avcodec_find_decoder(codecParameters->codec_id);
+    if (codec == nullptr) {
+        std::cout << "无法找到解码器" << std::endl;
+        return;
+    }
+
+    // 创建解码器上下文
+    AVCodecContext* codecContext = avcodec_alloc_context3(codec);
+    if (codecContext == nullptr) {
+        std::cout << "无法创建解码器上下文" << std::endl;
+        return;
+    }
+
+    // 打开解码器
+    if (avcodec_open2(codecContext, codec, nullptr) < 0) {
+        std::cout << "无法打开解码器" << std::endl;
+        return;
+    }
+
+    AVFrame* frame = av_frame_alloc();
+    int      cvLinesizes[1];
+    while (av_read_frame(format_ctx, &packet) >= 0) {
+        // if (packet.stream_index == video_stream_index) {
+        //     // 过滤并提取裸码流
+        //     ret = av_bitstream_filter_filter(
+        //         bsf_ctx, format_ctx->streams[video_stream_index]->codec,
+        //         nullptr, &packet.data, &packet.size, packet.data,
+        //         packet.size, packet.flags & AV_PKT_FLAG_KEY);
+        //     if (ret > 0) {
+        //         image_frame_t* frame_t = new image_frame_t();
+        //         frame_t->packet_data   = malloc(packet.size);
+        //         memcpy(frame_t->packet_data, packet.data, packet.size);
+        //         frame_t->packet_size = packet.size;
+        //         int pkt_eos          = 0;
+        //         decoder_->Decode((uint8_t*)frame_t->packet_data,
+        //                          frame_t->packet_size, 0, frame_t);
+        //         free(frame_t->packet_data);
+        //         frame_t->packet_data = nullptr;
+        //         free(frame_t->virt_addr);
+        //         frame_t->virt_addr = nullptr;
+        //         delete[] frame_t;
+        //         frame_t = nullptr;
+        //         // printf("push queue size:%d\n", frame_queue_.size());
+        //         // frame_queue_.push(std::move(frame_t));
+        //         auto end = std::chrono::high_resolution_clock::now();
+        //         // 计算时间差
+        //         auto duration =
+        //             std::chrono::duration_cast<std::chrono::milliseconds>(end
+        //             -
+        //                                                                   start)
+        //                 .count();
+
+        //         printf("current cost: %d ms\n", duration);
+        //     }
+        //     else {
+        //         // printf("------------error---------------\n");
+        //     }
+        // }
+        if (packet.stream_index == video_stream_index) {
+            ret = av_bitstream_filter_filter(
+                bsf_ctx, format_ctx->streams[video_stream_index]->codec,
+                nullptr, &packet.data, &packet.size, packet.data, packet.size,
+                packet.flags & AV_PKT_FLAG_KEY);
+            avcodec_send_packet(codecContext, &packet);
+            while (avcodec_receive_frame(codecContext, frame) == 0) {
+                int width  = frame->width;
+                int height = frame->height;
+
+                // Allocate the opencv mat and store its stride in a 1-element
+                // array
+                image_frame_t* frame_job = new image_frame_t();
+                cvLinesizes[0]           = 3 * frame->width;
+                frame_job->virt_addr = malloc(frame->width * frame->height * 3);
+                uchar*      mat_data = (uchar*)frame_job->virt_addr;
+                SwsContext* conversion = sws_getContext(
+                    width, height, (AVPixelFormat)frame->format, width, height,
+                    AVPixelFormat::AV_PIX_FMT_BGR24, SWS_FAST_BILINEAR, NULL,
+                    NULL, NULL);
+                sws_scale(conversion, frame->data, frame->linesize, 0, height,
+                          &mat_data, cvLinesizes);
+                frame_job->height = frame->height;
+                frame_job->width  = frame->width;
+                // free(mat_data);
+                // delete[] frame_job;
+                // frame_job = nullptr;
+                frame_queue_.push(std::move(frame_job));
+                // printf("frame idx:%d\n", frame_index);
+                frame_index++;
+                sws_freeContext(conversion);
+                // auto end = std::chrono::high_resolution_clock::now();
+                //         // 计算时间差
+                // auto duration =
+                //     std::chrono::duration_cast<std::chrono::milliseconds>(end
+                //     -
+                //                                                           start)
+                //         .count();
+
+                // printf("current cost: %d ms\n", duration);
+                // if (duration > 1000)
+                //     exit(0);
+            }
+        }
+
+        av_packet_unref(&packet);
+    }
+    av_frame_free(&frame);
+    // exit(0);
+    printf("read stream ok!\n");
+    // auto end = std::chrono::high_resolution_clock::now();
+    // // 计算时间差
+    // auto duration =
+    //     std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
+    //         .count();
+
+    // printf("total cost: %d ms\n", duration);
+    // 清理资源
+    av_bitstream_filter_close(bsf_ctx);
+    avformat_close_input(&format_ctx);
+}
+// void Decoder::process_decode(app_context_t* ctx, std::promise<bool>& pro)
+// {
+//     pro.set_value(true);
+//     static int frame_value = 0;
+//     static int null_num    = 0;
+//     while (true) {
+//         // printf("frame_queue_ size:%d\n", frame_queue_.size());
+//         // printf("queue size:%d\n", frame_queue_.size());
+//         image_frame_t* frame = frame_queue_.get();
+
+//         ctx->decoder->Decode((uint8_t*)frame->packet_data,
+//         frame->packet_size,
+//                              0, frame);
+//         free(frame->packet_data);
+//         if (frame->virt_addr == nullptr) {
+//             // frame_queue_.pop();
+//             // cond_stream_producer_.notify_one();
+//             delete[] frame;
+//             frame = nullptr;
+
+//             // printf("frame virt_add is null!\n");
+//             continue;
+//         }
+//         // free(frame->virt_addr);
+
+//         // cond_stream_producer_.notify_one();
+
+//         {
+//             unique_lock<std::mutex> l(frame_decode_queue_lock_);
+//             cond_decode_producer_.wait(l, [&]() {
+//                 return frame_decode_queue_.size() < MAX_QUEUE_SIZE;
+//             });
+
+//             frame_decode_queue_.push(std::move(frame));
+
+//             cond_decode_consumer_.notify_all();
+//         }
+//     }
+// }
+vector<long long> Decoder::get_frame()
+{
+    // printf("队列长度---视频流队列：%d\n", frame_queue_.size());
+    image_frame_t* frame_job = frame_queue_.get();
+
+    // auto start = std::chrono::high_resolution_clock::now();
+    // auto end = std::chrono::high_resolution_clock::now();
+    // // 计算时间差
+    // auto duration =
+    //     std::chrono::duration_cast<std::chrono::milliseconds>(end -
+    //     start)
+    //         .count();
+
+    // 输出时间差
+    // printf("memcpy cost: %d ms\n", duration);
+    int   mat_size = frame_job->width * frame_job->height * 3;
+    void* mat_data = malloc(mat_size);
+    memcpy(mat_data, frame_job->virt_addr, mat_size);
+    vector<long long> mat_info = {(long long)mat_data, frame_job->width,
+                                  frame_job->height};
+    free(frame_job->virt_addr);
+    frame_job->virt_addr = nullptr;
+    delete[] frame_job;
+    frame_job = nullptr;
+    return mat_info;
+}
+int Decoder::stop()
+{
+    return 0;
+}
+
+static unsigned char* load_data(FILE* fp, size_t ofst, size_t sz)
+{
+    unsigned char* data;
+    int            ret;
+
+    data = NULL;
+
+    if (NULL == fp) {
+        return NULL;
+    }
+
+    ret = fseek(fp, ofst, SEEK_SET);
+    if (ret != 0) {
+        printf("blob seek failure.\n");
+        return NULL;
+    }
+
+    data = (unsigned char*)malloc(sz);
+    if (data == NULL) {
+        printf("buffer malloc failure.\n");
+        return NULL;
+    }
+    ret = fread(data, 1, sz, fp);
+    return data;
+}
+
+static unsigned char* read_file_data(const char* filename, int* model_size)
+{
+    FILE*          fp;
+    unsigned char* data;
+
+    fp = fopen(filename, "rb");
+    if (NULL == fp) {
+        printf("Open file %s failed.\n", filename);
+        return NULL;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    int size = ftell(fp);
+
+    data = load_data(fp, 0, size);
+
+    fclose(fp);
+
+    *model_size = size;
+    return data;
+}
+IDecoder* xtkj::createDecoder()
+{
+    return new Decoder();
+}
+
+void xtkj::releaseDecoder(IDecoder* pIDecoder)
+{
+    delete[] pIDecoder;
+    pIDecoder = nullptr;
+}
+#ifdef __cplusplus
+}
+#endif
