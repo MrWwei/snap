@@ -39,6 +39,7 @@ class CaptureSnap : public xtkj::ICaptureSnap {
   private:
     ThreadPool pool_;
     int        time_out_{0};
+    int        thread_num_{0};
 };
 
 int get_cpu_num()
@@ -62,13 +63,21 @@ int CaptureSnap::cur_task_num()
 }
 int CaptureSnap::init(int thread_num, int queue_size, int time_out)
 {
+    thread_num_ = thread_num;
+    time_out_   = time_out;
+    if (thread_num == 0) {
+        return 0;
+    }
     thread_num = get_cpu_num() * 2;
     queue_size = thread_num * 2;
     pool_.init(thread_num, queue_size, time_out);
-    time_out_ = time_out;
+    return 0;
 }
 cv::Mat CaptureSnap::snap_shoot(string rtsp_url)
 {
+    if (thread_num_ == 0)
+        return do_shoot(rtsp_url.c_str(), time_out_);
+
     auto res = pool_.enqueue(do_shoot, rtsp_url.c_str(), time_out_);
     return res.get();
 }
