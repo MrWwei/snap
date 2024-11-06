@@ -88,6 +88,7 @@ namespace xtkj {
         mk_player_set_option(player, "rtp_type", "0");
         mk_player_set_option(player, "protocol_timeout_ms", "10000");
         mk_player_set_option(player, "media_timeout_ms", "10000");
+        mk_player_set_option(player, "wait_track_ready", "flase");
 
         mk_player_play(player, rtsp);
 
